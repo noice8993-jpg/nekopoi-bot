@@ -1,7 +1,11 @@
 import re
-import aiohttp
+import asyncio
+import cloudscraper
 from bs4 import BeautifulSoup
 from config import HEADERS
+
+_SCRAPER = cloudscraper.create_scraper()
+_LOCK = asyncio.Lock()
 
 
 async def extract_video_urls(post_content: str, page_url: str = None) -> list[dict]:
@@ -28,7 +32,6 @@ async def extract_video_urls(post_content: str, page_url: str = None) -> list[di
         if url:
             results.append({"label": src, "url": url})
 
-    # Fallback: direct video links in content
     if not results:
         url = _find_direct_links(post_content)
         if url:
@@ -38,28 +41,39 @@ async def extract_video_urls(post_content: str, page_url: str = None) -> list[di
 
 
 def _find_iframes_in_html(html: str) -> list[str]:
-    """Extract iframe src URLs from HTML string."""
     pattern = re.compile(r'<iframe[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
     return [m.group(1) for m in pattern.finditer(html)]
 
 
+async def _fetch_page(url: str) -> str | None:
+    """Fetch a page using cloudscraper to bypass Cloudflare."""
+    loop = asyncio.get_event_loop()
+    try:
+        async with _LOCK:
+            return await loop.run_in_executor(None, _sync_fetch, url)
+    except Exception:
+        return None
+
+
+def _sync_fetch(url: str) -> str:
+    resp = _SCRAPER.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+    resp.raise_for_status()
+    return resp.text
+
+
 async def _resolve_iframe(src: str) -> str | None:
-    """Follow iframe URL to find direct video source."""
     html = await _fetch_page(src)
     if not html:
         return None
 
-    # Method 1: Direct <video> or <source> tags
     url = _parse_video_tag(html)
     if url:
         return url
 
-    # Method 2: DoodStream pass_md5 token
     url = _parse_doodstream(html, src)
     if url:
         return url
 
-    # Method 3: Any direct .mp4/.m3u8 URL in page
     url = _parse_direct_links(html)
     if url:
         return url
@@ -67,51 +81,32 @@ async def _resolve_iframe(src: str) -> str | None:
     return None
 
 
-async def _fetch_page(url: str) -> str | None:
-    """Fetch a page, handling redirects."""
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as s:
-            async with s.get(url, allow_redirects=True, ssl=False) as resp:
-                return await resp.text()
-    except Exception:
-        return None
-
-
 def _parse_video_tag(html: str) -> str | None:
-    """Extract direct video URL from <video> or <source> tags."""
     soup = BeautifulSoup(html, "lxml")
-
     video = soup.find("video")
     if video:
         src = video.get("src")
         if src:
             return src
-
     for source in soup.find_all("source"):
         src = source.get("src")
         if src:
             return src
-
     return None
 
 
 def _parse_doodstream(html: str, page_url: str) -> str | None:
-    """Extract DoodStream pass_md5 token and resolve to direct URL."""
     pattern = re.compile(r"/pass_md5/[^\"'\s]+")
     match = pattern.search(html)
     if not match:
         return None
 
     path = match.group(0)
-
-    # Build full URL
     if path.startswith("http"):
         doodle_url = path
     elif path.startswith("//"):
         doodle_url = "https:" + path
     else:
-        # Extract domain from page_url
         from urllib.parse import urlparse
         parsed = urlparse(page_url)
         doodle_url = f"{parsed.scheme}://{parsed.netloc}{path}"
@@ -120,7 +115,6 @@ def _parse_doodstream(html: str, page_url: str) -> str | None:
 
 
 def _parse_direct_links(html: str) -> str | None:
-    """Find any direct .mp4/.m3u8 URL in page."""
     pattern = re.compile(r'https?://[^\s"\'<>]+\.(mp4|m3u8)([^\s"\'<>]*)', re.IGNORECASE)
     for m in pattern.finditer(html):
         url = m.group(0).rstrip(".,;:!?)")
@@ -129,7 +123,6 @@ def _parse_direct_links(html: str) -> str | None:
 
 
 def _find_direct_links(content: str) -> str | None:
-    """Find direct video links in post content."""
     pattern = re.compile(r'https?://[^\s"\'<>]+\.(mp4|m3u8)([^\s"\'<>]*)', re.IGNORECASE)
     for m in pattern.finditer(content):
         url = m.group(0).rstrip(".,;:!?)")
@@ -137,43 +130,34 @@ def _find_direct_links(content: str) -> str | None:
     return None
 
 
-async def _resolve_doodstream(url: str) -> str | None:
-    """Follow pass_md5 to get direct video URL.
-
-    DoodStream pass_md5 endpoint can respond in 3 ways:
-    - HTTP redirect (302) to the direct video URL
-    - Body contains a raw CDN URL (no HTML, no .mp4 extension)
-    - Body contains HTML with embedded video URL
-    """
+def _sync_fetch_doodstream(url: str) -> str | None:
+    """Sync resolve DoodStream pass_md5 using cloudscraper."""
     try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as s:
-            async with s.get(url, allow_redirects=True, ssl=False) as resp:
-                if resp.status != 200:
-                    return None
-                final = str(resp.url)
-                # Case 1: Redirected to a different URL
-                if final != url:
-                    return final
-                # Case 2: Body is a raw URL (no HTML tags, just a URL)
-                body = await resp.text()
-                body_stripped = body.strip()
-                if body_stripped.startswith("http://") or body_stripped.startswith("https://"):
-                    # Check it's not HTML (no <tag)
-                    if not body_stripped.startswith("<"):
-                        return body_stripped.split("\n")[0].strip()
-                # Case 3: Body has HTML, search for video links
-                return _parse_direct_links(body)
+        resp = _SCRAPER.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        final = str(resp.url)
+        if final != url:
+            return final
+        body = resp.text.strip()
+        if body.startswith("http://") or body.startswith("https://"):
+            if not body.startswith("<"):
+                return body.split("\n")[0].strip()
+        return _parse_direct_links(body)
     except Exception:
         return None
-    return None
+
+
+async def _resolve_doodstream(url: str) -> str | None:
+    loop = asyncio.get_event_loop()
+    try:
+        async with _LOCK:
+            return await loop.run_in_executor(None, _sync_fetch_doodstream, url)
+    except Exception:
+        return None
 
 
 async def get_download_link(post: dict) -> dict | None:
-    """Get direct download link from a post object.
-
-    Returns: {title, video_url, post_link} or None
-    """
     content = post.get("content", {}).get("rendered", "")
     link = post.get("link", "")
 

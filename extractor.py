@@ -1,24 +1,14 @@
 import re
 import asyncio
-import cloudscraper
+import subprocess
 from bs4 import BeautifulSoup
 from config import HEADERS
 
-_SCRAPER = cloudscraper.create_scraper()
-_LOCK = asyncio.Lock()
-
 
 async def extract_video_urls(post_content: str, page_url: str = None) -> list[dict]:
-    """Extract video URLs from post.
-
-    The WordPress API content often lacks iframes, so we fetch the full page
-    if page_url is provided and no iframes found in content.
-    """
     iframes = _find_iframes_in_html(post_content)
-
-    # If no iframes in API content, fetch full page
     if not iframes and page_url:
-        html = await _fetch_page(page_url)
+        html = await _fetch_page_with_curl(page_url)
         if html:
             iframes = _find_iframes_in_html(html)
 
@@ -45,24 +35,56 @@ def _find_iframes_in_html(html: str) -> list[str]:
     return [m.group(1) for m in pattern.finditer(html)]
 
 
-async def _fetch_page(url: str) -> str | None:
-    """Fetch a page using cloudscraper to bypass Cloudflare."""
+async def _fetch_page_with_curl(url: str) -> str | None:
+    """Use subprocess curl to bypass Cloudflare (same as working curl in terminal)."""
     loop = asyncio.get_event_loop()
     try:
-        async with _LOCK:
-            return await loop.run_in_executor(None, _sync_fetch, url)
-    except Exception:
+        return await loop.run_in_executor(None, _sync_curl, url)
+    except Exception as e:
         return None
 
 
-def _sync_fetch(url: str) -> str:
-    resp = _SCRAPER.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
-    resp.raise_for_status()
-    return resp.text
+def _sync_curl(url: str) -> str:
+    ua = HEADERS["User-Agent"]
+    cmd = [
+        "curl", "-s", "-L",
+        "-A", ua,
+        "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "-H", "Accept-Language: en-US,en;q=0.5",
+        "-H", "Referer: https://nekopoi.care/",
+        "-H", "DNT: 1",
+        "--max-time", "30",
+        url,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+    if result.returncode != 0:
+        return None
+    html = result.stdout
+    # Check if Cloudflare challenge
+    if "cdn-cgi/challenge" in html or ("cloudflare" in html.lower() and "__cf_chl" in html):
+        return None
+    return html
+
+
+def _sync_curl_get(url: str) -> str | None:
+    """Fetch URL with curl and return response body."""
+    ua = HEADERS["User-Agent"]
+    cmd = [
+        "curl", "-s", "-L",
+        "-A", ua,
+        "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "-H", "Referer: https://playmogo.com/",
+        "--max-time", "30",
+        url,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+    if result.returncode != 0:
+        return None
+    return result.stdout
 
 
 async def _resolve_iframe(src: str) -> str | None:
-    html = await _fetch_page(src)
+    html = await _fetch_page_with_curl(src)
     if not html:
         return None
 
@@ -130,29 +152,18 @@ def _find_direct_links(content: str) -> str | None:
     return None
 
 
-def _sync_fetch_doodstream(url: str) -> str | None:
-    """Sync resolve DoodStream pass_md5 using cloudscraper."""
+async def _resolve_doodstream(url: str) -> str | None:
+    """Resolve DoodStream pass_md5 via curl."""
+    loop = asyncio.get_event_loop()
     try:
-        resp = _SCRAPER.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
-        if resp.status_code != 200:
+        body = await loop.run_in_executor(None, _sync_curl_get, url)
+        if not body:
             return None
-        final = str(resp.url)
-        if final != url:
-            return final
-        body = resp.text.strip()
+        body = body.strip()
         if body.startswith("http://") or body.startswith("https://"):
             if not body.startswith("<"):
                 return body.split("\n")[0].strip()
         return _parse_direct_links(body)
-    except Exception:
-        return None
-
-
-async def _resolve_doodstream(url: str) -> str | None:
-    loop = asyncio.get_event_loop()
-    try:
-        async with _LOCK:
-            return await loop.run_in_executor(None, _sync_fetch_doodstream, url)
     except Exception:
         return None
 

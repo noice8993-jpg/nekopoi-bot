@@ -138,17 +138,32 @@ def _find_direct_links(content: str) -> str | None:
 
 
 async def _resolve_doodstream(url: str) -> str | None:
-    """Follow pass_md5 redirect to get direct video URL."""
+    """Follow pass_md5 to get direct video URL.
+
+    DoodStream pass_md5 endpoint can respond in 3 ways:
+    - HTTP redirect (302) to the direct video URL
+    - Body contains a raw CDN URL (no HTML, no .mp4 extension)
+    - Body contains HTML with embedded video URL
+    """
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as s:
             async with s.get(url, allow_redirects=True, ssl=False) as resp:
-                if resp.status == 200:
-                    final = str(resp.url)
-                    if final and final != url:
-                        return final
-                    html = await resp.text()
-                    return _parse_direct_links(html)
+                if resp.status != 200:
+                    return None
+                final = str(resp.url)
+                # Case 1: Redirected to a different URL
+                if final != url:
+                    return final
+                # Case 2: Body is a raw URL (no HTML tags, just a URL)
+                body = await resp.text()
+                body_stripped = body.strip()
+                if body_stripped.startswith("http://") or body_stripped.startswith("https://"):
+                    # Check it's not HTML (no <tag)
+                    if not body_stripped.startswith("<"):
+                        return body_stripped.split("\n")[0].strip()
+                # Case 3: Body has HTML, search for video links
+                return _parse_direct_links(body)
     except Exception:
         return None
     return None
